@@ -99,6 +99,7 @@ if ~numel(dir(fullfile(dirname, strcat('bnd4_', num2str(numverts), '.mat'))))
     cfg2.method = 'iso2mesh'; %'projectmesh' 
 
     bnd = ft_prepare_mesh(cfg2, segmentedmri);
+    bnd = remove_isolated_vertices(bnd);
     save(fullfile(dirname, strcat('bnd4_', num2str(numverts))), 'bnd');
     % cedalion export
     scalp.pos = bnd(1).pos;
@@ -156,6 +157,21 @@ end
 end %create_surface_meshes
 
 
+
+
+function [bnd] = remove_isolated_vertices(bnd)
+  % Drop vertices that no triangle references (iso2mesh/cgalsurf can leave a
+  % few); they break vertex-ring smoothing and are useless for BEM/FEM.
+  for ii=1:numel(bnd)
+      used = false(size(bnd(ii).pos,1),1);
+      used(bnd(ii).tri(:)) = true;
+      if all(used), continue; end
+      newidx = cumsum(used);
+      bnd(ii).pos = bnd(ii).pos(used,:);
+      bnd(ii).tri = newidx(bnd(ii).tri);
+      fprintf('Removed %d isolated vertices from mesh %d.\n', sum(~used), ii);
+  end
+end %remove_isolated_vertices
 
 
 function [nrm] = normals(pnt, tri, opt)
@@ -280,7 +296,9 @@ function xyzn=lpflow_trismooth(xyz,t)
 
   % Initialize etc.
   k=0;
-  [conn,connnum,count]=neighborelem(t,max(max(t)));
+  % size the map by the vertex count: vertices not referenced by any
+  % triangle (iso2mesh can leave some) would otherwise index past it
+  [conn,connnum,count]=neighborelem(t,size(xyz,1));
   xyzn = xyz;
   while k<length(xyz)
       k=k+1;

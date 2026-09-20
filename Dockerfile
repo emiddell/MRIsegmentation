@@ -67,6 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
+        patch \
         sudo \
         tini \
         unzip \
@@ -149,11 +150,14 @@ RUN --mount=type=bind,source=cat12_r2159.zip,target=/tmp/cat12_r2159.zip \
 RUN git clone --depth 1 https://github.com/fangq/iso2mesh.git
 
 # Andy's tools (Huang et al. 2013) incl. eTPM.nii, patched to store the
-# nonlinear warp fields (needed for electrode/fiducial alignment)
+# nonlinear warp fields (needed for electrode/fiducial alignment) and to
+# survive heads with few connected CSF/skin components (docker/patches/)
 RUN --mount=type=bind,source=Huang_et_al_2013.zip,target=/tmp/Huang_et_al_2013.zip \
+    --mount=type=bind,source=docker/patches,target=/tmp/patches \
     unzip -q /tmp/Huang_et_al_2013.zip -d ./Huang_et_al_2013 \
     && sed -i 's/warp\.write = \[0 0\]/warp\.write = \[1 1\]/' Huang_et_al_2013/start_seg.m \
-    && grep -q 'warp.write = \[1 1\]' Huang_et_al_2013/start_seg.m
+    && grep -q 'warp.write = \[1 1\]' Huang_et_al_2013/start_seg.m \
+    && patch -p1 -d Huang_et_al_2013 < /tmp/patches/mysegment-component-count.patch
 
 # NIfTI and ANALYZE tools (Jimmy Shen, File Exchange 8797)
 RUN wget -q "https://www.mathworks.com/matlabcentral/mlc-downloads/downloads/submissions/8797/versions/28/download/zip" \
@@ -210,8 +214,9 @@ RUN chmod 0755 /usr/local/bin/mriseg \
 # `matlab -batch` calls too.
 ENV MATLABPATH=${MRISEG_HOME}:${MRISEG_HOME}/docker:${MRISEG_HOME}/MRIsegmentation
 
-# Usage telemetry tags as in MathWorks' reference Dockerfile
-ENV MW_DDUX_FORCE_ENABLE=true MW_CONTEXT_TAGS=MATLAB:BATCHLICENSING:DOCKERFILE:V1
+# MathWorks' reference Dockerfile force-enables usage telemetry (DDUX) here;
+# it crashed MATLAB with heap corruption in the container, so it stays off.
+ENV MW_DDUX_FORCE_ENABLE=false
 
 USER matlab
 WORKDIR ${MRISEG_HOME}

@@ -39,6 +39,8 @@ mkdir -p "${MATLAB_PREFDIR}"
 # fail with exit code 127.
 export MATLAB_SHELL=/bin/bash
 export SHELL=/bin/bash
+# Usage telemetry (DDUX) crashed MATLAB inside the container; telemetry only.
+export MW_DDUX_FORCE_ENABLE=false
 
 # mriseg_init sets up the path; matlab -batch exits non-zero on any error so the
 # calling workflow sees the failure.

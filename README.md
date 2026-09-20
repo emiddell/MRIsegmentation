@@ -148,6 +148,16 @@ environment, `MLM_LICENSE_FILE=27000@licenseserver` (network license),
 `container.license_file: /path/to/license.lic` (license file) or
 `MLM_LICENSE_TOKEN` ([batch licensing token](https://www.mathworks.com/support/batch-tokens.html)).
 
+**Apptainer on Ubuntu ≥ 23.10.** Two one-time system tweaks: install
+`squashfuse` so the `.sif` is mounted instead of being extracted (3.8 GB into
+`/tmp`) for every job, and give Apptainer permission to create user namespaces
+(Ubuntu's apptainer package has no AppArmor profile; without it every run fails
+with `Failed to create container process: Operation not permitted`):
+```bash
+$ sudo apt install squashfuse
+$ sudo cp docker/apparmor-apptainer /etc/apparmor.d/apptainer && sudo apparmor_parser -r /etc/apparmor.d/apptainer
+```
+
 The image is also usable without Snakemake:
 `apptainer exec mriseg.sif mriseg "start_segmentation_cedalion('/data/sub01/T1.nii')"`
 runs a whole entry script; `mriseg` accepts any MATLAB statement after setting

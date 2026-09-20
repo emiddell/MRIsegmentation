@@ -48,6 +48,10 @@ container:
   #            files are yours without copying the image), host otherwise
   #   root | host (= $(id -u):$(id -g)) | keep-id (podman --userns=keep-id) | "uid:gid"
   user: auto
+  # Bind this checkout's MRIsegmentation/ folder over the copy inside the image
+  # (at container.home, default /opt/MRIsegmentation), so edits to the pipeline
+  # code take effect without rebuilding the image.
+  bind_code: true
   # Extra arguments appended to `apptainer exec` / `podman run`, e.g.
   # `--security-opt label=disable` on SELinux hosts.
   extra_args: ""

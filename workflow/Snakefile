@@ -109,6 +109,9 @@ def matlab_t2_arg(wc):
 # ----------------------------------------------------------------------------
 # Container runner
 # ----------------------------------------------------------------------------
+MRISEG_HOME = config["container"].get("home", "/opt/MRIsegmentation")
+
+
 def podman_is_rootless():
     try:
         out = subprocess.run(
@@ -146,6 +149,9 @@ def container_prefix():
     extra = c.get("extra_args", "") or ""
     mounts = [A(RES)]
     envs = ["MLM_LICENSE_TOKEN", "MLM_LICENSE_FILE"]
+    # MATLAB's usage-telemetry service (DDUX) has crashed MATLAB inside the
+    # container with heap corruption at startup/exit; it is telemetry only.
+    setenv = {"MW_DDUX_FORCE_ENABLE": "false"}
     lic = c.get("license_file") or ""
     lic_env = ""
     if lic:
@@ -153,19 +159,30 @@ def container_prefix():
         mounts.append(lic)
         lic_env = f"MLM_LICENSE_FILE={shlex.quote(lic)}"
 
+    # (host path, container path) pairs; the results dir at the same path
+    binds = [(m, m) for m in mounts]
+    if c.get("bind_code", True):
+        # Use this checkout's pipeline code instead of the copy baked into the
+        # image, so fixes to MRIsegmentation/*.m don't need an image rebuild.
+        code = os.path.join(os.path.dirname(workflow.basedir), "MRIsegmentation")
+        binds.append((code, f"{MRISEG_HOME}/MRIsegmentation"))
+
     if engine == "none":
-        return f"env {lic_env}" if lic_env else ""
+        return "env " + " ".join(f"{k}={v}" for k, v in setenv.items()) + (f" {lic_env}" if lic_env else "")
     if engine in ("podman", "docker"):
         user = container_user(engine, c.get("user", "auto"))
-        vols = " ".join(f"-v {shlex.quote(m)}:{shlex.quote(m)}" for m in mounts)
+        vols = " ".join(f"-v {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
         env = " ".join(f"-e {e}" for e in envs)
+        env += " " + " ".join(f"-e {k}={v}" for k, v in setenv.items())
         if lic_env:
             env += f" -e {lic_env}"
         return f"{engine} run --rm {user} {vols} {env} {extra} {image}"
     if engine in ("apptainer", "singularity"):
-        binds = " ".join(f"--bind {shlex.quote(m)}" for m in mounts)
-        env = f"--env {lic_env}" if lic_env else ""
-        return f"{engine} exec {binds} {env} {extra} {image}"
+        vols = " ".join(f"--bind {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
+        env = " ".join(f"--env {k}={v}" for k, v in setenv.items())
+        if lic_env:
+            env += f" --env {lic_env}"
+        return f"{engine} exec {vols} {env} {extra} {image}"
     raise ValueError(f"unknown container engine {engine!r}")
 
 

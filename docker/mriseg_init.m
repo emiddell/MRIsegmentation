@@ -16,7 +16,6 @@ end
 cd(home);
 
 addpath(home);
-addpath(fullfile(home, 'MRIsegmentation'));
 
 % FieldTrip: ft_defaults adds the required subfolders itself
 addpath(fullfile(home, 'fieldtrip'));
@@ -36,6 +35,9 @@ addpath(fullfile(home, 'iso2mesh'));
 addpath(fullfile(home, 'Huang_et_al_2013'));
 addpath(fullfile(home, 'NIfTI_tools'));
 addpath(fullfile(home, 'weighted-SPHARM'));
+
+% last, so the pipeline's own folder shadows everything above
+addpath(fullfile(home, 'MRIsegmentation'));
 
 fprintf('MRIsegmentation environment ready (%s, MATLAB %s)\n', home, version);
 end
