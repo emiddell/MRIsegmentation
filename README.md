@@ -104,6 +104,57 @@ $ matlab -r "start_segmentation(./example_head/T1.nii); exit;"
 # For fNIRS/DOT run
 $ matlab -r "start_segmentation_cedalion(./example_head/T1.nii); exit;"
 ```
+
+### Container + Snakemake workflow
+Instead of installing everything by hand, build the container image (MATLAB via
+[mpm](https://github.com/mathworks-ref-arch/matlab-dockerfile), SPM12, CAT12,
+FieldTrip, iso2mesh, Andy's tools, NIfTI tools, HArtMuT, weighted-SPHARM) and
+run the pipeline step by step with [Snakemake](https://snakemake.readthedocs.io):
+```bash
+# 1. Dependency archives (SPM12, CAT12 r2159, Andy's tools) next to the Dockerfile.
+#    Optional: put atra1.0_LinuxCentOS6.7.tar.gz there too for ACPC preprocessing.
+$ bash docker/fetch-deps.sh
+# 2. Build the image (podman or docker; ~12 GB, MATLAB is downloaded by mpm) and
+#    convert it for apptainer (~4 GB mriseg.sif, see licensing below).
+#    --build-arg MATLAB_RELEASE=R2024b / MATLAB_TOOLBOXES="..." to change defaults.
+$ podman build -t mrisegmentation .
+$ bash docker/build-sif.sh
+# 3. Describe your subjects (tab separated: subject, t1, t2) and settings
+$ $EDITOR config/samples.tsv config/config.yaml   # pipeline: cedalion | eeg
+# 4. Run
+$ pip install snakemake
+$ snakemake -n              # dry run: shows the per-subject jobs
+$ snakemake --cores 2       # two subjects in parallel
+```
+Outputs are written to `results/<subject>/` (the same files the entry scripts
+produce, next to the staged `<subject>.nii`), MATLAB logs to
+`results/logs/<subject>/<step>.log`. Each pipeline function is one rule
+(`spm_segment` → `tissue_masks` → `surface_meshes` / `volume_meshes` → `cat12` →
+`parcellation` / `mne_export`, plus `align_electrodes`, `hartmut_*`, `sourcemodel`,
+`transform_to_ctf`, `spharm` for the EEG pipeline), so a failed or changed step
+only reruns from there: `snakemake --cores 1 results/sub01/parcels.json`.
+
+**MATLAB licensing inside the container.** By default the image is built in
+online-licensing mode (`--build-arg MATLAB_LICMODE=onlinelicensing`), i.e. MATLAB
+licenses through your MathWorks account exactly like a desktop install where you
+chose "sign in". No credentials go into the image: the workflow runs the `.sif`
+with apptainer, which executes the container as *you* with your home directory,
+hostname and network, so MATLAB inside finds the sign-in your host MATLAB cached
+in `~/.matlab` / `~/.MathWorks` (sign in once on the host with the same release;
+Individual licenses work this way without a token). podman/docker do not share
+that identity — the cached credentials fail their integrity check there — so for
+those build with `--build-arg MATLAB_LICMODE=file` and provide, in your
+environment, `MLM_LICENSE_FILE=27000@licenseserver` (network license),
+`container.license_file: /path/to/license.lic` (license file) or
+`MLM_LICENSE_TOKEN` ([batch licensing token](https://www.mathworks.com/support/batch-tokens.html)).
+
+The image is also usable without Snakemake:
+`apptainer exec mriseg.sif mriseg "start_segmentation_cedalion('/data/sub01/T1.nii')"`
+runs a whole entry script; `mriseg` accepts any MATLAB statement after setting
+up the path (`docker/mriseg_init.m`). With podman use
+`podman run --rm --user root -e MLM_LICENSE_FILE -v /data:/data mrisegmentation mriseg "..."`
+(rootless podman: container root is your user, so the outputs belong to you;
+with docker use `--user $(id -u):$(id -g)`).
 <!--- 
 # Or alternatively in parallel:
 $ python parallel.py ./data/MRI_scan1/T1.nii ./data/MRI_scan2/T1.img ./data/MRI_scan3/T1.nii.gz

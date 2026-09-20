@@ -1,0 +1,492 @@
+"""
+MRIsegmentation Snakemake workflow.
+
+Runs the segmentation pipeline (start_segmentation.m / start_segmentation_cedalion.m)
+step by step, one MATLAB call per rule, inside the container built from the
+Dockerfile in the repository root. Every rule invokes the `mriseg` wrapper of the
+image, which sets up the MATLAB path (docker/mriseg_init.m) and runs one pipeline
+function. Outputs land in <results_dir>/<subject>/ next to the staged T1, exactly
+as when calling the entry scripts by hand.
+
+    snakemake --cores 4                       # run configured pipeline for all subjects
+    snakemake --cores 1 results/sub01/parcels.json
+    snakemake -n                              # dry run
+"""
+
+import csv
+import os
+import re
+import shlex
+import subprocess
+
+
+configfile: "config/config.yaml"
+
+
+# ----------------------------------------------------------------------------
+# Samples
+# ----------------------------------------------------------------------------
+SAMPLES = {}
+with open(config["samples"]) as fh:
+    for row in csv.DictReader(fh, delimiter="\t"):
+        subject = row["subject"].strip()
+        if not subject or subject.startswith("#"):
+            continue
+        t2 = (row.get("t2") or "").strip()
+        SAMPLES[subject] = {"t1": row["t1"].strip(), "t2": t2 or None}
+
+
+def has_t2(subject):
+    return SAMPLES[subject]["t2"] is not None
+
+
+def subject_regex(subjects):
+    """Wildcard constraint matching exactly the given subjects (nothing if empty)."""
+    return "|".join(re.escape(s) for s in subjects) if subjects else "(?!)"
+
+
+wildcard_constraints:
+    subject=subject_regex(SAMPLES) if SAMPLES else "[^/]+",
+
+
+# ----------------------------------------------------------------------------
+# Naming
+# ----------------------------------------------------------------------------
+PIPELINE = config["pipeline"]
+if PIPELINE not in ("cedalion", "eeg"):
+    raise ValueError(f"config 'pipeline' must be 'cedalion' or 'eeg', got {PIPELINE!r}")
+PREPROC = bool(config.get("preprocessing", False))
+MESH = config["mesh"][PIPELINE]
+
+RES = config.get("results_dir", "results").rstrip("/")
+D = f"{RES}/{{subject}}"
+LOGS = f"{RES}/logs/{{subject}}"
+
+# The SPM/CAT12 scripts derive all output names from the basename of the image
+# they are given. With ACPC preprocessing that image is <subject>_RAS.nii.
+BASE = "{subject}_RAS" if PREPROC else "{subject}"
+BASE_T2 = "{subject}_T2_RAS" if PREPROC else "{subject}_T2"
+IMG = f"{D}/{BASE}.nii"
+IMG_T2 = f"{D}/{BASE_T2}.nii"
+
+
+def mnum(x):
+    """Format a number the way MATLAB's num2str does in the pipeline's file names."""
+    return str(int(x)) if float(x).is_integer() else str(x)
+
+
+NV = mnum(MESH["num_vertices"])
+NC = mnum(MESH["num_cortex_verts"])
+MV = mnum(MESH["maxvoxelvolume"])
+NS = mnum(MESH.get("num_sources", 4000))
+SPHARM_L = mnum(MESH.get("spharm_degree", 50))
+
+TISSUES = ["air", "skin", "bone", "csf", "gray", "white"]
+MASKS = [f"{D}/mask_{t}.nii" for t in TISSUES]
+SPM_CLASSES = [f"{D}/c{i}{BASE}.nii" for i in range(1, 7)]
+CAT_SURF = f"{D}/surf"
+CAT_SURFACES = [
+    f"{CAT_SURF}/{h}.{s}.{BASE}.gii"
+    for h in ("lh", "rh")
+    for s in ("central", "sphere", "sphere.reg", "white")
+] + [f"{CAT_SURF}/{h}.thickness.{BASE}" for h in ("lh", "rh")]
+
+
+def A(path):
+    """Absolute host path; the results dir is mounted at the same path in the container."""
+    return os.path.abspath(path)
+
+
+def t2_input(pattern):
+    """Input function returning the staged T2 for subjects that have one."""
+    return lambda wc: [pattern.format(subject=wc.subject)] if has_t2(wc.subject) else []
+
+
+def matlab_t2_arg(wc):
+    return f"'{A(IMG_T2.format(subject=wc.subject))}'" if has_t2(wc.subject) else "[]"
+
+
+# ----------------------------------------------------------------------------
+# Container runner
+# ----------------------------------------------------------------------------
+def podman_is_rootless():
+    try:
+        out = subprocess.run(
+            ["podman", "info", "--format", "{{.Host.Security.Rootless}}"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out == "true"
+
+
+def container_user(engine, mode):
+    """--user flag so that files written by MATLAB belong to the host user.
+
+    Rootless podman maps container root onto the host user, so running as root
+    is the cheap option there; --userns=keep-id would work too but forces podman
+    to create an ID-mapped copy of the whole 12 GB image on first use. Rootful
+    podman and docker need the host uid/gid instead.
+    """
+    if mode == "auto":
+        mode = "root" if engine == "podman" and podman_is_rootless() else "host"
+    if mode == "root":
+        return "--user root"
+    if mode == "host":
+        return "--user $(id -u):$(id -g)"
+    if mode == "keep-id":
+        return "--userns=keep-id"
+    return f"--user {mode}"  # explicit uid:gid
+
+
+def container_prefix():
+    c = config["container"]
+    engine = c.get("engine", "podman")
+    image = c["image"]
+    extra = c.get("extra_args", "") or ""
+    mounts = [A(RES)]
+    envs = ["MLM_LICENSE_TOKEN", "MLM_LICENSE_FILE"]
+    lic = c.get("license_file") or ""
+    lic_env = ""
+    if lic:
+        lic = A(lic)
+        mounts.append(lic)
+        lic_env = f"MLM_LICENSE_FILE={shlex.quote(lic)}"
+
+    if engine == "none":
+        return f"env {lic_env}" if lic_env else ""
+    if engine in ("podman", "docker"):
+        user = container_user(engine, c.get("user", "auto"))
+        vols = " ".join(f"-v {shlex.quote(m)}:{shlex.quote(m)}" for m in mounts)
+        env = " ".join(f"-e {e}" for e in envs)
+        if lic_env:
+            env += f" -e {lic_env}"
+        return f"{engine} run --rm {user} {vols} {env} {extra} {image}"
+    if engine in ("apptainer", "singularity"):
+        binds = " ".join(f"--bind {shlex.quote(m)}" for m in mounts)
+        env = f"--env {lic_env}" if lic_env else ""
+        return f"{engine} exec {binds} {env} {extra} {image}"
+    raise ValueError(f"unknown container engine {engine!r}")
+
+
+RUN = container_prefix()
+THREADS = int(config["resources"].get("threads", 1))
+MEM_MB = int(config["resources"].get("mem_mb", 16000))
+
+
+def mriseg(cmd):
+    """Shell line running one MATLAB statement inside the container."""
+    return f'{RUN} mriseg "{cmd}" > {{log}} 2>&1'
+
+
+# MATLAB path helpers, resolved inside the container (mriseg_init cd's to MRISEG_HOME)
+ETPM = "fullfile(pwd, 'Huang_et_al_2013', 'eTPM.nii')"
+CAT12 = "fullfile(pwd, 'fieldtrip', 'external', 'spm12', 'toolbox', 'cat12')"
+ATLAS_DIR = "fullfile(pwd, 'Schaefer2018_Parcellations')"
+HARTMUT = "fullfile(pwd, 'HArtMuT')"
+
+
+# ----------------------------------------------------------------------------
+# Targets
+# ----------------------------------------------------------------------------
+def final_targets(subject):
+    d = D.format(subject=subject)
+    base = BASE.format(subject=subject)
+    if PIPELINE == "cedalion":
+        targets = [
+            f"{d}/mask_scalp{NV}_smoothed.stl",
+            f"{d}/mesh6_maxvox{MV}.msh",
+            f"{d}/parcels.json",
+            f"{d}/mne/{base}/bem/outer_skin.surf",
+        ]
+    else:
+        targets = [
+            f"{d}/mesh6_maxvox{MV}_hartmut.msh",
+            f"{d}/ctf/acpc2ctf.mat",
+            f"{d}/ctf/lh_fourier_vector.mat",
+        ]
+        if PREPROC:
+            targets += [
+                f"{d}/artefact_sourcemodel_HArtMuT_small.mat",
+                f"{d}/mri_bnd.mat",
+            ]
+    return targets
+
+
+localrules:
+    all,
+    stage_t1,
+    stage_t2,
+
+
+rule all:
+    input:
+        [t for s in SAMPLES for t in final_targets(s)],
+
+
+# ----------------------------------------------------------------------------
+# Input staging (host side, no MATLAB)
+# ----------------------------------------------------------------------------
+rule stage_t1:
+    """Copy (and gunzip) the T1 into the results folder as <subject>.nii."""
+    input:
+        lambda wc: SAMPLES[wc.subject]["t1"],
+    output:
+        f"{D}/{{subject}}.nii",
+    shell:
+        r"""
+        if [[ "{input}" == *.gz ]]; then gunzip -c "{input}" > "{output}"; else cp "{input}" "{output}"; fi
+        """
+
+
+rule stage_t2:
+    input:
+        lambda wc: SAMPLES[wc.subject]["t2"],
+    output:
+        f"{D}/{{subject}}_T2.nii",
+    shell:
+        r"""
+        if [[ "{input}" == *.gz ]]; then gunzip -c "{input}" > "{output}"; else cp "{input}" "{output}"; fi
+        """
+
+
+# ----------------------------------------------------------------------------
+# Optional ACPC alignment (ATRA)
+# ----------------------------------------------------------------------------
+# ATRA aligns all images of a subject jointly, so the T2 (if any) is an output
+# of the same call. Outputs must be static, hence one rule per case, constrained
+# to the subjects with / without a T2.
+rule preprocess:
+    """Detect AC/PC with ATRA and reorient into the ACPC (RAS) coordinate system."""
+    input:
+        t1=f"{D}/{{subject}}.nii",
+    output:
+        t1=f"{D}/{{subject}}_RAS.nii",
+    log:
+        f"{LOGS}/preprocess.log",
+    params:
+        cmd=lambda wc, input: f"preprocessing({{'{A(input.t1)}'}})",
+    wildcard_constraints:
+        subject=subject_regex([s for s in SAMPLES if not has_t2(s)]),
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+rule preprocess_with_t2:
+    """Same as preprocess, aligning T1 and T2 jointly."""
+    input:
+        t1=f"{D}/{{subject}}.nii",
+        t2=f"{D}/{{subject}}_T2.nii",
+    output:
+        t1=f"{D}/{{subject}}_RAS.nii",
+        t2=f"{D}/{{subject}}_T2_RAS.nii",
+    log:
+        f"{LOGS}/preprocess.log",
+    params:
+        cmd=lambda wc, input: f"preprocessing({{'{A(input.t1)}', '{A(input.t2)}'}})",
+    wildcard_constraints:
+        subject=subject_regex([s for s in SAMPLES if has_t2(s)]),
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+# ----------------------------------------------------------------------------
+# Tissue segmentation
+# ----------------------------------------------------------------------------
+rule spm_segment:
+    """SPM12 unified segmentation with the extended TPM (Huang et al. 2013)."""
+    input:
+        img=IMG,
+        t2=t2_input(IMG_T2),
+    output:
+        SPM_CLASSES,
+        seg8=f"{D}/{BASE}_seg8.mat",
+        warp=f"{D}/y_{BASE}.nii",
+        invwarp=f"{D}/iy_{BASE}.nii",
+    log:
+        f"{LOGS}/spm_segment.log",
+    params:
+        cmd=lambda wc, input: f"start_seg('{A(input.img)}', {matlab_t2_arg(wc)}, {ETPM}, false)",
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+rule tissue_masks:
+    """Andy's tools: clean up the SPM posteriors into binary tissue masks."""
+    input:
+        SPM_CLASSES,
+    output:
+        MASKS,
+    log:
+        f"{LOGS}/tissue_masks.log",
+    params:
+        cmd=lambda wc: f"mysegment('{A(D.format(subject=wc.subject))}', '{BASE.format(subject=wc.subject)}', true)",
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+# ----------------------------------------------------------------------------
+# Meshes
+# ----------------------------------------------------------------------------
+if PIPELINE == "cedalion":
+
+    rule surface_meshes:
+        """iso2mesh surface meshes (scalp, skull, csf, cortex) + STL/OBJ exports for cedalion."""
+        input:
+            img=IMG,
+            masks=MASKS,
+        output:
+            f"{D}/segmentedmri.mat",
+            f"{D}/bnd4_{NV}.mat",
+            f"{D}/bnd4_{NV}_corrected.mat",
+            f"{D}/bnd4_{NV}_corrected_scalp.tri",
+            f"{D}/mask_scalp{NV}.stl",
+            f"{D}/mask_scalp{NV}_smoothed.stl",
+            f"{D}/mask_scalp.obj",
+            f"{D}/mask_brain{NV}.stl",
+        log:
+            f"{LOGS}/surface_meshes.log",
+        params:
+            cmd=lambda wc, input: f"create_surface_meshes_cedalion('{A(input.img)}', {NV})",
+        threads: THREADS
+        resources:
+            mem_mb=MEM_MB,
+        shell:
+            mriseg("{params.cmd}")
+
+else:
+
+    rule surface_meshes:
+        """projectmesh BEM surfaces incl. neck-extended HArtMuT variants (EEG pipeline)."""
+        input:
+            img=IMG,
+            masks=MASKS,
+        output:
+            f"{D}/segmentedmri.mat",
+            f"{D}/segmentedmri_bem_hartmut.mat",
+            expand(f"{D}/bnd4_{NV}{{v}}.mat", v=["", "_corrected", "_hartmut", "_hartmut_corrected"], allow_missing=True),
+            expand(
+                f"{D}/bnd4_{NV}{{v}}_{{t}}.tri",
+                v=["", "_corrected", "_hartmut", "_hartmut_corrected"],
+                t=["scalp", "skull", "csf", "cortex"],
+                allow_missing=True,
+            ),
+        log:
+            f"{LOGS}/surface_meshes.log",
+        params:
+            cmd=lambda wc, input: f"create_surface_meshes('{A(input.img)}', {NV})",
+        threads: THREADS
+        resources:
+            mem_mb=MEM_MB,
+        shell:
+            mriseg("{params.cmd}")
+
+
+rule volume_meshes:
+    """iso2mesh tetrahedral volume mesh with tissue labels (+ neck-extended variant)."""
+    input:
+        img=IMG,
+        masks=MASKS,
+    output:
+        f"{D}/segmentedmri_hartmut.mat",
+        expand(f"{D}/mesh6_maxvox{MV}{{v}}.{{ext}}", v=["", "_hartmut"], ext=["mat", "msh"], allow_missing=True),
+    log:
+        f"{LOGS}/volume_meshes.log",
+    params:
+        cmd=lambda wc, input: f"create_volume_meshes('{A(input.img)}', {MV})",
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+# ----------------------------------------------------------------------------
+# CAT12 cortical surfaces
+# ----------------------------------------------------------------------------
+rule cat12:
+    """CAT12 segmentation and cortical surface reconstruction."""
+    input:
+        img=IMG,
+    output:
+        CAT_SURFACES,
+        report=f"{D}/report/cat_{BASE}.mat",
+    log:
+        f"{LOGS}/cat12.log",
+    params:
+        cmd=lambda wc, input: (
+            f"cat12 = {CAT12}; "
+            f"start_cat('{A(input.img)}', "
+            "fullfile(cat12, 'atlases_surfaces', 'lh.aparc_DK40.freesurfer.annot'), "
+            "fullfile(cat12, 'templates_MNI152NLin2009cAsym', 'Template_1_Dartel.nii'))"
+        ),
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+# ----------------------------------------------------------------------------
+# cedalion exports
+# ----------------------------------------------------------------------------
+rule parcellation:
+    """Schaefer2018 parcels on the CAT12 cortex -> mask_brain.obj + parcels.json."""
+    input:
+        img=IMG,
+        surfaces=CAT_SURFACES,
+    output:
+        f"{D}/mask_brain.obj",
+        f"{D}/parcels.json",
+    log:
+        f"{LOGS}/parcellation.log",
+    params:
+        cmd=lambda wc, input: f"label_subject_and_write_json('{A(input.img)}', {ATLAS_DIR}, {NC})",
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+rule mne_export:
+    """FreeSurfer-like subject folder (BEM surfaces + white matter) for MNE-Python."""
+    input:
+        img=IMG,
+        bnd=f"{D}/bnd4_{NV}_corrected.mat",
+        surfaces=CAT_SURFACES,
+    output:
+        f"{D}/mne/{BASE}/mri/T1.nii",
+        expand(f"{D}/mne/{BASE}/bem/{{s}}.surf", s=["outer_skin", "outer_skull", "inner_skull", "inner_csf"], allow_missing=True),
+        expand(f"{D}/mne/{BASE}/surf/{{h}}.white", h=["lh", "rh"], allow_missing=True),
+    log:
+        f"{LOGS}/mne_export.log",
+    params:
+        cmd=lambda wc, input: f"make_mne_freesurfer_like('{A(input.img)}', {NV})",
+    threads: THREADS
+    resources:
+        mem_mb=MEM_MB,
+    shell:
+        mriseg("{params.cmd}")
+
+
+# ----------------------------------------------------------------------------
+# EEG pipeline: electrodes, HArtMuT, sourcemodel, CTF, SPHARM
+# ----------------------------------------------------------------------------
+# Defined for the EEG pipeline only: with the cedalion settings they would
+# compete with surface_meshes for mask_brain<N>.stl (num_vertices == num_cortex_verts).
+if PIPELINE == "eeg":
+
+    include: "rules/eeg.smk"
