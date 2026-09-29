@@ -134,6 +134,47 @@ produce, next to the staged `<subject>.nii`), MATLAB logs to
 `transform_to_ctf`, `spharm` for the EEG pipeline), so a failed or changed step
 only reruns from there: `snakemake --cores 1 results/sub01/parcels.json`.
 
+**Tissue probability map.** SPM segments with the extended eTPM of Andy's
+tools by default (skull/scalp/air priors down to the neck). On some template
+heads it collapses — Colin27 ends up with empty GM/WM/CSF classes and the
+workflow now stops at `tissue_masks` with a clear error instead of failing
+later in the meshing. For such inputs set `spm_tpm: TPM` (SPM12's own
+`tpm/TPM.nii`, same six classes, coarser skull/scalp priors and no neck) in
+`config/config.yaml`, or per subject via a `tpm` column in the sample sheet.
+
+**FreeSurfer path (optional).** With `freesurfer.enabled: true` the workflow
+also runs `recon-all` (+ `mkheadsurf` for the scalp) per subject in a separate
+FreeSurfer container, in parallel to the MATLAB steps, and exports the surfaces
+into the same coordinate system as the MATLAB results for direct comparison:
+```bash
+$ apptainer pull freesurfer.sif docker://freesurfer/freesurfer:7.4.1   # ~9 GB
+$ $EDITOR config/config.yaml    # freesurfer.license: path to your license.txt
+```
+`results/<subject>/fs/<subject>/` is a regular FreeSurfer subject directory
+(`SUBJECTS_DIR=results/<subject>/fs`), `results/<subject>/fs/*.obj` are the
+scalp (`scalp`, `scalp_smoothed`), `lh/rh.white`, `lh/rh.pial` and combined
+`cortex_white` / `cortex_pial` surfaces with vertices as 1-based voxel indices
+of the staged NIfTI — the convention of `mask_scalp.obj` / `mask_brain.obj`
+(see `workflow/scripts/fs_surfaces_to_voxel.py` for the tkr-RAS → voxel chain).
+A T2 in the sample sheet is used for pial refinement (`-T2pial`); inputs taller
+than 256 mm get `-cw256` automatically. `mkheadsurf`'s head mask is cleaned
+before tessellation: a small morphological opening (`freesurfer.scalp_open_radius`)
+removes the thin sheets that ghosting artefacts next to the head otherwise leave
+on the scalp surface, and a population prior (`freesurfer.scalp_margin_mm`,
+`freesurfer.scalp_dim_below`) drops voxels that lie above the vertex, outside
+the MNI305 population head (via the subject's `talairach.xfm`) and dark in the
+normalised T1 — structures that touch the scalp and therefore survive any
+opening, such as the bar across the top of the Colin27 template. A head that is
+merely larger than the template keeps its bright scalp. `scalp_dim_below` must
+stay below the intensity of the outer scalp rim, which fades to ~40-70 in the
+normalised T1: a higher value shaves the crown instead of only the artefact.
+`mri/seghead.orig.mgz` keeps the uncleaned mask for inspection. recon-all takes a few hours per subject
+(`freesurfer.threads`, default 8, for `-parallel -openmp`). With both paths
+present, `results/qc/<subject>/surfaces_matlab_vs_freesurfer.{png,json}` shows
+exact cross-sections of the MATLAB scalp / CAT12 cortex and the FreeSurfer
+scalp / pial / white surfaces on the T1 plus nearest-vertex distances (needs
+numpy, scipy, nibabel and matplotlib in the Snakemake environment).
+
 **MATLAB licensing inside the container.** By default the image is built in
 online-licensing mode (`--build-arg MATLAB_LICMODE=onlinelicensing`), i.e. MATLAB
 licenses through your MathWorks account exactly like a desktop install where you
@@ -200,6 +241,13 @@ $ python parallel.py ./data/MRI_scan1/T1.nii ./data/MRI_scan2/T1.img ./data/MRI_
 <br>
 
 ## Mesh construction
+- Before meshing, labelled voxels that cannot belong to the head are dropped
+  (`restrict_to_head.m`): voxels whose air prior in the tissue probability map,
+  sampled in native space through SPM's deformation field `iy_*.nii`, exceeds
+  0.99, and everything outside the largest connected non-air region. This
+  removes ghosting/averaging artefacts next to the head that SPM labels as
+  tissue when the background is very clean (e.g. the lateral smears of the
+  ICBM152 template), which otherwise end up as fins on the scalp mesh.
 - Boundary surface meshes per tissue are triangulated with *cgalsurf* as 
 <img align="right" width="250" src="images/volmesh.png"> <br>
   implemented in the fieldtrip toolbox [[6]](#ref6). From these meshes (bnd5.mat) <br>

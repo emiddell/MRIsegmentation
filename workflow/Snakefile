@@ -33,7 +33,8 @@ with open(config["samples"]) as fh:
         if not subject or subject.startswith("#"):
             continue
         t2 = (row.get("t2") or "").strip()
-        SAMPLES[subject] = {"t1": row["t1"].strip(), "t2": t2 or None}
+        tpm = (row.get("tpm") or "").strip()
+        SAMPLES[subject] = {"t1": row["t1"].strip(), "t2": t2 or None, "tpm": tpm or None}
 
 
 def has_t2(subject):
@@ -142,48 +143,59 @@ def container_user(engine, mode):
     return f"--user {mode}"  # explicit uid:gid
 
 
-def container_prefix():
+def runner(image, binds=(), env=(), passthrough=(), tmpdir=None):
+    """Command prefix running a program inside `image` with the configured engine.
+
+    binds:       (host path, container path) pairs
+    env:         (name, value) pairs set inside the container
+    passthrough: env var names copied from the host if set (podman/docker only;
+                 apptainer passes the host environment anyway)
+    tmpdir:      shell expression (e.g. "$tmp") of a host directory to use as
+                 TMPDIR inside the container; expanded by the shell at run time
+    """
     c = config["container"]
     engine = c.get("engine", "podman")
-    image = c["image"]
     extra = c.get("extra_args", "") or ""
-    mounts = [A(RES)]
-    envs = ["MLM_LICENSE_TOKEN", "MLM_LICENSE_FILE"]
+    env = [(k, shlex.quote(v)) for k, v in env]
+    if tmpdir:
+        env.append(("TMPDIR", tmpdir))
+    if engine == "none":
+        return "env " + " ".join(f"{k}={v}" for k, v in env)
+    if engine in ("podman", "docker"):
+        user = container_user(engine, c.get("user", "auto"))
+        vols = " ".join(f"-v {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
+        if tmpdir:
+            vols += f" -v {tmpdir}:{tmpdir}"
+        envs = " ".join(f"-e {e}" for e in passthrough)
+        envs += " " + " ".join(f"-e {k}={v}" for k, v in env)
+        return f"{engine} run --rm {user} {vols} {envs} {extra} {image}"
+    if engine in ("apptainer", "singularity"):
+        vols = " ".join(f"--bind {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
+        if tmpdir:
+            vols += f" --bind {tmpdir}:{tmpdir}"
+        envs = " ".join(f"--env {k}={v}" for k, v in env)
+        return f"{engine} exec {vols} {envs} {extra} {image}"
+    raise ValueError(f"unknown container engine {engine!r}")
+
+
+def container_prefix():
+    """Runner for the MATLAB image (mriseg)."""
+    c = config["container"]
+    # the results dir at the same path inside the container
+    binds = [(A(RES), A(RES))]
     # MATLAB's usage-telemetry service (DDUX) has crashed MATLAB inside the
     # container with heap corruption at startup/exit; it is telemetry only.
-    setenv = {"MW_DDUX_FORCE_ENABLE": "false"}
+    env = [("MW_DDUX_FORCE_ENABLE", "false")]
     lic = c.get("license_file") or ""
-    lic_env = ""
     if lic:
-        lic = A(lic)
-        mounts.append(lic)
-        lic_env = f"MLM_LICENSE_FILE={shlex.quote(lic)}"
-
-    # (host path, container path) pairs; the results dir at the same path
-    binds = [(m, m) for m in mounts]
+        binds.append((A(lic), A(lic)))
+        env.append(("MLM_LICENSE_FILE", A(lic)))
     if c.get("bind_code", True):
         # Use this checkout's pipeline code instead of the copy baked into the
         # image, so fixes to MRIsegmentation/*.m don't need an image rebuild.
         code = os.path.join(os.path.dirname(workflow.basedir), "MRIsegmentation")
         binds.append((code, f"{MRISEG_HOME}/MRIsegmentation"))
-
-    if engine == "none":
-        return "env " + " ".join(f"{k}={v}" for k, v in setenv.items()) + (f" {lic_env}" if lic_env else "")
-    if engine in ("podman", "docker"):
-        user = container_user(engine, c.get("user", "auto"))
-        vols = " ".join(f"-v {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
-        env = " ".join(f"-e {e}" for e in envs)
-        env += " " + " ".join(f"-e {k}={v}" for k, v in setenv.items())
-        if lic_env:
-            env += f" -e {lic_env}"
-        return f"{engine} run --rm {user} {vols} {env} {extra} {image}"
-    if engine in ("apptainer", "singularity"):
-        vols = " ".join(f"--bind {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
-        env = " ".join(f"--env {k}={v}" for k, v in setenv.items())
-        if lic_env:
-            env += f" --env {lic_env}"
-        return f"{engine} exec {vols} {env} {extra} {image}"
-    raise ValueError(f"unknown container engine {engine!r}")
+    return runner(c["image"], binds, env, passthrough=["MLM_LICENSE_TOKEN", "MLM_LICENSE_FILE"], tmpdir="$tmp")
 
 
 RUN = container_prefix()
@@ -192,15 +204,46 @@ MEM_MB = int(config["resources"].get("mem_mb", 16000))
 
 
 def mriseg(cmd):
-    """Shell line running one MATLAB statement inside the container."""
-    return f'{RUN} mriseg "{cmd}" > {{log}} 2>&1'
+    """Shell line running one MATLAB statement inside the container.
+
+    Every job gets a private TMPDIR: iso2mesh (surface and volume meshing)
+    writes intermediate files with fixed names to <tempdir>/iso2mesh-<user>,
+    which concurrent jobs would otherwise overwrite for each other.
+    """
+    return (
+        'tmp=$(mktemp -d "${{TMPDIR:-/tmp}}/mriseg.XXXXXX"); trap \'rm -rf "$tmp"\' EXIT; '
+        f'{RUN} mriseg "{cmd}" > {{log}} 2>&1'
+    )
 
 
 # MATLAB path helpers, resolved inside the container (mriseg_init cd's to MRISEG_HOME)
-ETPM = "fullfile(pwd, 'Huang_et_al_2013', 'eTPM.nii')"
+def tpm_expr(subject):
+    """MATLAB expression for the tissue probability map SPM segments with.
+
+    config spm_tpm, overridable per subject via a `tpm` column in the sample
+    sheet: eTPM (extended FOV map of Andy's tools, default), TPM (SPM12's own
+    tpm/TPM.nii, same six classes in the same order) or a path to a 6-class map.
+    """
+    tpm = SAMPLES[subject]["tpm"] or config.get("spm_tpm", "eTPM")
+    if tpm == "eTPM":
+        return "fullfile(pwd, 'Huang_et_al_2013', 'eTPM.nii')"
+    if tpm == "TPM":
+        return "fullfile(spm('Dir'), 'tpm', 'TPM.nii')"
+    return f"'{A(tpm)}'"
 CAT12 = "fullfile(pwd, 'fieldtrip', 'external', 'spm12', 'toolbox', 'cat12')"
 ATLAS_DIR = "fullfile(pwd, 'Schaefer2018_Parcellations')"
 HARTMUT = "fullfile(pwd, 'HArtMuT')"
+
+
+# ----------------------------------------------------------------------------
+# FreeSurfer path (optional, own container image)
+# ----------------------------------------------------------------------------
+if config.get("freesurfer", {}).get("enabled", False):
+
+    include: "rules/freesurfer.smk"
+
+else:
+    FS_EXPORTS = []
 
 
 # ----------------------------------------------------------------------------
@@ -209,15 +252,21 @@ HARTMUT = "fullfile(pwd, 'HArtMuT')"
 def final_targets(subject):
     d = D.format(subject=subject)
     base = BASE.format(subject=subject)
+    if config.get("freesurfer", {}).get("enabled", False):
+        targets = [f"{d}/fs/{name}.obj" for name in FS_EXPORTS]
+    else:
+        targets = []
+    if PIPELINE == "cedalion" and FS_EXPORTS:
+        targets.append(f"{RES}/qc/{subject}/surfaces_matlab_vs_freesurfer.png")
     if PIPELINE == "cedalion":
-        targets = [
+        targets += [
             f"{d}/mask_scalp{NV}_smoothed.stl",
             f"{d}/mesh6_maxvox{MV}.msh",
             f"{d}/parcels.json",
             f"{d}/mne/{base}/bem/outer_skin.surf",
         ]
     else:
-        targets = [
+        targets += [
             f"{d}/mesh6_maxvox{MV}_hartmut.msh",
             f"{d}/ctf/acpc2ctf.mat",
             f"{d}/ctf/lh_fourier_vector.mat",
@@ -329,7 +378,7 @@ rule spm_segment:
     log:
         f"{LOGS}/spm_segment.log",
     params:
-        cmd=lambda wc, input: f"start_seg('{A(input.img)}', {matlab_t2_arg(wc)}, {ETPM}, false)",
+        cmd=lambda wc, input: f"start_seg('{A(input.img)}', {matlab_t2_arg(wc)}, {tpm_expr(wc.subject)}, false)",
     threads: THREADS
     resources:
         mem_mb=MEM_MB,
@@ -346,7 +395,10 @@ rule tissue_masks:
     log:
         f"{LOGS}/tissue_masks.log",
     params:
-        cmd=lambda wc: f"mysegment('{A(D.format(subject=wc.subject))}', '{BASE.format(subject=wc.subject)}', true)",
+        cmd=lambda wc: (
+            f"mysegment('{A(D.format(subject=wc.subject))}', '{BASE.format(subject=wc.subject)}', true); "
+            f"check_tissue_masks('{A(D.format(subject=wc.subject))}')"
+        ),
     threads: THREADS
     resources:
         mem_mb=MEM_MB,

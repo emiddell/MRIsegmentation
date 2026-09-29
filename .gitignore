@@ -8,3 +8,4 @@ results/
 .snakemake/
 atra1.0_*.tar.gz
 mriseg.sif
+freesurfer.sif

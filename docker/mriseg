@@ -42,6 +42,16 @@ export SHELL=/bin/bash
 # Usage telemetry (DDUX) crashed MATLAB inside the container; telemetry only.
 export MW_DDUX_FORCE_ENABLE=false
 
+# Private temp directory unless the caller provides one: iso2mesh writes
+# fixed-name intermediate files to <tempdir>/iso2mesh-<user>, so concurrent
+# sessions sharing /tmp corrupt each other's meshes. MATLAB's tempdir follows
+# TMPDIR.
+if [[ -z "${MRISEG_KEEP_TMPDIR:-}" && "${TMPDIR:-/tmp}" == "/tmp" ]]; then
+    export TMPDIR
+    TMPDIR="$(mktemp -d /tmp/mriseg.XXXXXX)"
+    trap 'rm -rf "${TMPDIR}"' EXIT
+fi
+
 # mriseg_init sets up the path; matlab -batch exits non-zero on any error so the
 # calling workflow sees the failure.
 batch="mriseg_init; ${cmd}"

@@ -62,6 +62,8 @@ if ~numel(dir(fullfile(dirname,'segmentedmri.mat')))
     segmentedmri.csf = c4.anatomy;
     segmentedmri.gray = c5.anatomy;
     segmentedmri.white = c6.anatomy;
+    % drop labelled voxels outside the head (ghosting artefacts etc.)
+    segmentedmri = restrict_to_head(segmentedmri, input_img);
     segmentedmri.whitegray = double(segmentedmri.gray|segmentedmri.white);
     segmentedmri.brain = segmentedmri.whitegray|segmentedmri.csf;
     se = ones(3,3,3);

@@ -18,6 +18,13 @@ pipeline: cedalion
 # script does not. The HArtMuT artefact sourcemodel additionally requires it.
 preprocessing: false
 
+# Tissue probability map for SPM's segmentation: eTPM (extended FOV map of
+# Andy's tools, the pipeline default) or TPM (SPM12's own tpm/TPM.nii, same six
+# classes). The eTPM fails on some template heads (e.g. Colin27: all brain
+# classes empty), where TPM works; a path to another 6-class map is accepted too.
+# Override per subject with a `tpm` column in the sample sheet.
+spm_tpm: eTPM
+
 mesh:
   cedalion:
     num_vertices: 15000      # scalp / SPM cortex surface mesh vertices
@@ -58,6 +65,42 @@ container:
   # Optional MATLAB license file to mount into the container (sets
   # MLM_LICENSE_FILE; podman/docker with MATLAB_LICMODE=file only).
   license_file: ""
+
+# Parallel FreeSurfer path (recon-all + mkheadsurf), independent of the MATLAB
+# steps. Writes results/<subject>/fs/<subject>/ (a FreeSurfer SUBJECTS_DIR
+# layout) and results/<subject>/fs/*.obj: scalp and cortex surfaces expressed in
+# 1-based voxel indices of the staged NIfTI, i.e. the same coordinates as
+# mask_scalp.obj / mask_brain.obj from the MATLAB pipeline, for direct comparison.
+freesurfer:
+  enabled: true
+  # apptainer pull freesurfer.sif docker://freesurfer/freesurfer:7.4.1
+  image: freesurfer.sif
+  # FreeSurfer license (https://surfer.nmr.mgh.harvard.edu/registration.html)
+  license: /home/eike/Projekte/ibslab/30_dev/segmentation/freesurfer_workdir/license.txt
+  # recon-all -T2 ... -T2pial when the subject has a T2
+  use_t2: true
+  # extra recon-all flags, e.g. "-3T" or "-hires"
+  recon_all_args: ""
+  # mris_smooth iterations for the smoothed scalp export (0 = skip)
+  scalp_smooth_iterations: 20
+  # morphological opening radius (voxels) applied to mkheadsurf's head mask to
+  # remove thin sheets from ghosting artefacts next to the head (0 = off)
+  scalp_open_radius: 1
+  # Population prior for the head mask: drop voxels that sit more than
+  # scalp_margin_mm outside the MNI305 population head (via the subject's
+  # talairach.xfm), above MNI z = 40 mm, AND are darker than scalp_dim_below in
+  # the intensity-normalised T1 (white matter = 110). Removes structures above
+  # the vertex that touch the scalp, such as the bar across the top of the
+  # Colin27 template; a head that is merely larger than the template keeps its
+  # bright scalp. Set scalp_margin_mm to null to disable.
+  scalp_margin_mm: 2
+  # Intensity (normalised T1, white matter = 110) below which such a voxel counts
+  # as artefact rather than scalp. The outer scalp rim legitimately fades to
+  # ~40-70, so a higher value shaves the crown instead of only cutting the
+  # artefact.
+  scalp_dim_below: 45
+  threads: 8               # recon-all -parallel -openmp N
+  mem_mb: 12000
 
 resources:
   # MATLAB/SPM/CAT12 are mostly single-threaded; threads mainly limits how many
