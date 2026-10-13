@@ -34,7 +34,17 @@ with open(config["samples"]) as fh:
             continue
         t2 = (row.get("t2") or "").strip()
         tpm = (row.get("tpm") or "").strip()
-        SAMPLES[subject] = {"t1": row["t1"].strip(), "t2": t2 or None, "tpm": tpm or None}
+        mni_from = (row.get("mni_from") or "").strip()
+        landmarks = (row.get("landmarks") or "").strip()
+        landmarks_reference = (row.get("landmarks_reference") or "").strip()
+        SAMPLES[subject] = {
+            "t1": row["t1"].strip(),
+            "t2": t2 or None,
+            "tpm": tpm or None,
+            "mni_from": mni_from or None,
+            "landmarks": landmarks or None,
+            "landmarks_reference": landmarks_reference or None,
+        }
 
 
 def has_t2(subject):
@@ -143,7 +153,7 @@ def container_user(engine, mode):
     return f"--user {mode}"  # explicit uid:gid
 
 
-def runner(image, binds=(), env=(), passthrough=(), tmpdir=None):
+def runner(image, binds=(), env=(), passthrough=(), tmpdir=None, shell_binds=(), pid_ns=False):
     """Command prefix running a program inside `image` with the configured engine.
 
     binds:       (host path, container path) pairs
@@ -152,6 +162,10 @@ def runner(image, binds=(), env=(), passthrough=(), tmpdir=None):
                  apptainer passes the host environment anyway)
     tmpdir:      shell expression (e.g. "$tmp") of a host directory to use as
                  TMPDIR inside the container; expanded by the shell at run time
+    shell_binds: like binds, but both paths are shell expressions evaluated at
+                 run time (so the caller's shell line has to define them)
+    pid_ns:      run in a private PID namespace, so that processes the payload
+                 detaches cannot outlive the container
     """
     c = config["container"]
     engine = c.get("engine", "podman")
@@ -164,17 +178,21 @@ def runner(image, binds=(), env=(), passthrough=(), tmpdir=None):
     if engine in ("podman", "docker"):
         user = container_user(engine, c.get("user", "auto"))
         vols = " ".join(f"-v {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
+        vols += "".join(f' -v "{h}:{k}"' for h, k in shell_binds)
         if tmpdir:
             vols += f" -v {tmpdir}:{tmpdir}"
         envs = " ".join(f"-e {e}" for e in passthrough)
         envs += " " + " ".join(f"-e {k}={v}" for k, v in env)
+        # a container of its own is a PID namespace of its own anyway
         return f"{engine} run --rm {user} {vols} {envs} {extra} {image}"
     if engine in ("apptainer", "singularity"):
         vols = " ".join(f"--bind {shlex.quote(h)}:{shlex.quote(k)}" for h, k in binds)
+        vols += "".join(f' --bind "{h}:{k}"' for h, k in shell_binds)
         if tmpdir:
             vols += f" --bind {tmpdir}:{tmpdir}"
         envs = " ".join(f"--env {k}={v}" for k, v in env)
-        return f"{engine} exec {vols} {envs} {extra} {image}"
+        ns = "--pid " if pid_ns else ""
+        return f"{engine} exec {ns}{vols} {envs} {extra} {image}"
     raise ValueError(f"unknown container engine {engine!r}")
 
 
@@ -195,7 +213,43 @@ def container_prefix():
         # image, so fixes to MRIsegmentation/*.m don't need an image rebuild.
         code = os.path.join(os.path.dirname(workflow.basedir), "MRIsegmentation")
         binds.append((code, f"{MRISEG_HOME}/MRIsegmentation"))
-    return runner(c["image"], binds, env, passthrough=["MLM_LICENSE_TOKEN", "MLM_LICENSE_FILE"], tmpdir="$tmp")
+    # $msh and $tmp/servicehost are set up by servicehost_state() in the shell line
+    apptainer = c.get("engine", "podman") in ("apptainer", "singularity")
+    return runner(
+        c["image"],
+        binds,
+        env,
+        passthrough=["MLM_LICENSE_TOKEN", "MLM_LICENSE_FILE"],
+        tmpdir="$tmp",
+        shell_binds=[("$tmp/servicehost", "$msh")] if apptainer else (),
+        pid_ns=True,
+    )
+
+
+def servicehost_state():
+    """Shell lines giving this job its own MathWorks Service Host state.
+
+    Online licensing reads the cached MathWorks sign-in from
+    ~/.MathWorks/ServiceHost/<hostname>, so that directory has to be visible
+    inside the container. It also holds the Service Host's runtime state: a
+    global lock and the endpoint of a daemon that detaches and outlives the
+    MATLAB that started it. Shared, every job - and every MATLAB on the host,
+    e.g. the one the VS Code extension starts - contends for that one daemon,
+    whose socket moreover sits in a per-job TMPDIR that no longer exists by the
+    time the next job connects to it. The symptom is "Unable to communicate with
+    required MathWorks services" (error 5001/5201), sometimes a Service Host
+    crash, and containers that hang on exit because the orphaned daemon keeps
+    them alive. Without its logs that state is ~25 kB, so each job simply gets
+    its own copy, bound over the shared one.
+    """
+    if config["container"].get("engine", "podman") not in ("apptainer", "singularity"):
+        # other engines do not share the caller's home, hence no shared state
+        return ""
+    return (
+        'msh="$HOME/.MathWorks/ServiceHost/$(hostname)"; mkdir -p "$msh" "$tmp/servicehost"; '
+        'tar -C "$msh" --exclude=./logs --exclude=./locks -cf - . '
+        '| tar -C "$tmp/servicehost" -xf -; '
+    )
 
 
 RUN = container_prefix()
@@ -211,7 +265,12 @@ def mriseg(cmd):
     which concurrent jobs would otherwise overwrite for each other.
     """
     return (
+        # several pipeline functions skip their work when the output file is
+        # already there (they were written to be resumable), so a rerun would
+        # silently keep stale results unless the outputs are removed first
+        'rm -f {output}; '
         'tmp=$(mktemp -d "${{TMPDIR:-/tmp}}/mriseg.XXXXXX"); trap \'rm -rf "$tmp"\' EXIT; '
+        f'{servicehost_state()}'
         f'{RUN} mriseg "{cmd}" > {{log}} 2>&1'
     )
 
@@ -244,6 +303,10 @@ if config.get("freesurfer", {}).get("enabled", False):
 
 else:
     FS_EXPORTS = []
+    DEC_ON = False
+    DEC_OUTS = []
+    HM_OUTS = []
+    LM_OUTS = []
 
 
 # ----------------------------------------------------------------------------
@@ -258,6 +321,16 @@ def final_targets(subject):
         targets = []
     if PIPELINE == "cedalion" and FS_EXPORTS:
         targets.append(f"{RES}/qc/{subject}/surfaces_matlab_vs_freesurfer.png")
+    if FS_EXPORTS:
+        targets.append(f"{RES}/qc/{subject}/masks_matlab_vs_freesurfer.png")
+    if FS_EXPORTS and DEC_ON and "cortex_pial" in (config["freesurfer"].get("decimate") or {}).get("targets", {}):
+        targets.append(f"{RES}/qc/{subject}/voxel_grouping_matlab_vs_freesurfer.png")
+    if FS_EXPORTS and DEC_ON:
+        targets += [o.format(subject=subject) for o in DEC_OUTS]
+        targets += [o.format(subject=subject) for o in HM_OUTS]
+        targets += [o.format(subject=subject) for o in LM_OUTS]
+        if LM_OUTS:
+            targets.append(f"{RES}/qc/{subject}/landmarks.png")
     if PIPELINE == "cedalion":
         targets += [
             f"{d}/mask_scalp{NV}_smoothed.stl",

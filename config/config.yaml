@@ -81,6 +81,9 @@ freesurfer:
   use_t2: true
   # extra recon-all flags, e.g. "-3T" or "-hires"
   recon_all_args: ""
+  # fsaverage6 atlas used by the voxel-grouping QC (and transferable to the
+  # surface): Schaefer17_600 or Schaefer17_1000, see Schaefer2018_Parcellations/
+  parcel_atlas: Schaefer17_600
   # mris_smooth iterations for the smoothed scalp export (0 = skip)
   scalp_smooth_iterations: 20
   # morphological opening radius (voxels) applied to mkheadsurf's head mask to
@@ -101,6 +104,66 @@ freesurfer:
   scalp_dim_below: 45
   threads: 8               # recon-all -parallel -openmp N
   mem_mb: 12000
+  # Decimate the high-resolution cortex surface (~320k vertices) for image
+  # reconstruction, keeping every vertex backed by cortical-ribbon voxels
+  # (workflow/scripts/fs_decimate_mesh.py). Runs on the host, not in the
+  # FreeSurfer container: it needs cedalion (plus trimesh, pymeshlab, rtree).1
+  decimate:
+    enabled: true
+    # fs_export surface -> decimation schedule (the last value is the target
+    # vertex count). Surfaces listed under ribbon_support get the voxel
+    # feedback loop, which needs the intermediate steps; the others are
+    # decimated in one step per entry.
+    targets:
+      cortex_pial: [30000, 28000, 27000, 26000, 25000]
+      scalp_smoothed: [10000]
+    # Surfaces whose vertices must keep cortical-ribbon voxels mapped onto them
+    # (image reconstruction). The scalp carries optodes and bounds the head,
+    # but nothing is reconstructed on it, so it needs no support.
+    ribbon_support: [cortex_pial, cortex_white]
+    voxel_stealing_from: 26000 # enable voxel stealing at/below this count
+    quality_radius: 15         # voxels; radius over which a vertex without
+                               # voxel support protects its surroundings
+    # Schaefer (or other) surface annotations for parcel-aware mapping, with
+    # {fs_subj} and {hemi} placeholders. They must come from the same recon-all
+    # run as the mesh. null = decimate without parcels, which also disables the
+    # head model export (it needs a parcel per vertex). Rule fs_annot writes
+    # these from parcel_atlas above; point this elsewhere to use your own.
+    annot: "{fs_subj}/label/{hemi}.Schaefer2018_600Parcels_17Networks_order.annot"
+    # Interpreter with cedalion; null = the one running Snakemake.
+    python: null
+    mem_mb: 16000
+  # Assemble results/<subject>/headmodel/, a cedalion head model directory in the
+  # layout of the published hm_colin27 / hm_icbm152 datasets: the decimated
+  # cortex and scalp surfaces, the tissue masks, the per-vertex parcel and MNI152
+  # table, the ribbon-voxel-to-vertex matrix and the parcel colours. Needs
+  # decimate.annot (a parcel per vertex) and cortex_pial among decimate.targets.
+  headmodel:
+    enabled: true
+    # What the image's own RAS already is, i.e. how the mni152_* columns of
+    # brain_vertex_coordinates.csv are reached:
+    #   talairach  an individual scanner RAS; recon-all's talairach.xfm registers
+    #              it to MNI305, then cedalion's fixed MNI305 -> MNI152 affine.
+    #   mni305     the image is a template distributed in MNI305 (Colin27), so
+    #              only the MNI305 -> MNI152 step is needed. What the published
+    #              cedalion head models did.
+    #   mni152     the image is already in MNI152 (the ICBM152 templates):
+    #              nothing to do, its own affine is the answer.
+    # Overridable per subject with an mni_from column in the sample sheet.
+    mni_from: talairach
+  # Build the 10-10 landmark system on the head model's scalp, from the four
+  # fiducials Nz, Iz, LPA and RPA. Those are not derived here: every subject
+  # points at its own markup file with a `landmarks` column in the sample sheet
+  # (see config/landmarks/README.md).
+  landmarks:
+    enabled: true
+    # Fiducials snapped onto the scalp before construction; [] uses them as
+    # given. Literature fiducials are defined on another head's scalp, so some
+    # offset from this subject's surface is normal.
+    snap: [Nz, Iz, LPA, RPA]
+    # A fiducial further than this from the scalp aborts the rule: that is what
+    # a markup file in the wrong coordinate system looks like.
+    max_snap_mm: 20
 
 resources:
   # MATLAB/SPM/CAT12 are mostly single-threaded; threads mainly limits how many

@@ -9,3 +9,4 @@ results/
 atra1.0_*.tar.gz
 mriseg.sif
 freesurfer.sif
+__pycache__/

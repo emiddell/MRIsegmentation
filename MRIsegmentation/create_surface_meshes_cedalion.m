@@ -100,8 +100,17 @@ if ~numel(dir(fullfile(dirname, strcat('bnd4_', num2str(numverts), '.mat'))))
     cfg2.transform = segmentedmri.transform;
     cfg2.method = 'iso2mesh'; %'projectmesh' 
 
-    bnd = ft_prepare_mesh(cfg2, segmentedmri);
+    % one compartment at a time, so that each surface bounds the solid
+    % compartment instead of the layer FieldTrip's indexed representation
+    % would leave (see prepare_nested_meshes)
+    bnd = prepare_nested_meshes(cfg2, segmentedmri);
     bnd = remove_isolated_vertices(bnd);
+    % cgalsurf can return surfaces with small holes or inside out; both break
+    % BEM and any inside/outside test (e.g. optodes placed on the scalp)
+    bnd = close_mesh_holes(bnd);
+    bnd = orient_outward(bnd);
+    expected_ml = cellfun(@(t) nnz(segmentedmri.(t)), cfg2.tissue) / 1000;
+    check_closed_surfaces(bnd, 'boundary', expected_ml);
     save(fullfile(dirname, strcat('bnd4_', num2str(numverts))), 'bnd');
     % cedalion export
     scalp.pos = bnd(1).pos;
